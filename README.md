@@ -11,7 +11,7 @@ The parts of [Codist](https://github.com/abxengg/codist) that deal with text fro
 import "github.com/abxengg/codist-model"
 import "github.com/abxengg/codist-model/incident"
 
-client := model.New("http://localhost:11434", "qwen2.5-coder:14b", 8192)
+client := model.New("http://localhost:11434", "qwen3.5:9b", 8192)
 ok, note := client.Status(ctx)
 errs := incident.Parse(logs)
 ```

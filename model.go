@@ -10,8 +10,17 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 )
+
+// maxBlank is how many pieces of nothing but blank space in a row end a reply. JSON between fields has a few.
+const maxBlank = 60
+
+// maxSilence is how long a model that has started writing may go without sending a word. A model that has broken
+// its own JSON text (an unescaped quote) can go on using up its whole reply limit without sending anything: seen
+// with Qwen 3.5, minutes of silence each time.
+var maxSilence = 30 * time.Second
 
 // Client calls one model on one server.
 type Client struct {
@@ -77,8 +86,12 @@ func (c *Client) ChatJSON(ctx context.Context, system, user string, schema any, 
 		format = schema
 	}
 	body, _ := json.Marshal(map[string]any{
-		"model": c.Name, "stream": false, "format": format, "keep_alive": "30m",
-		"options":  map[string]any{"temperature": 0.1, "num_ctx": c.Ctx, "num_predict": 1500},
+		// think false: a model that reasons before it answers (Qwen 3.5, MiMo) can spend the whole reply on
+		// reasoning and return no JSON at all. Models without that mode take the field and ignore it.
+		// stream true: the reply is read as it is written, so a reply that turns into blank space is cut off (below).
+		"model": c.Name, "stream": true, "format": format, "keep_alive": "30m", "think": false,
+		// A reply cut off at the limit is not JSON and the whole call is lost; Qwen 3.5 writes replies of 1,500 tokens.
+		"options":  map[string]any{"temperature": 0.1, "num_ctx": c.Ctx, "num_predict": 2500},
 		"messages": []map[string]string{{"role": "system", "content": system}, {"role": "user", "content": user}},
 	})
 	start := time.Now()
@@ -109,6 +122,8 @@ func (c *Client) ChatJSON(ctx context.Context, system, user string, schema any, 
 		}
 	}()
 	logger().Debug("model call", "model", c.Name, "system_chars", len(system), "user_chars", len(user), "schema", schema != nil)
+	ctx, stop := context.WithTimeout(ctx, 12*time.Minute) // no reply is worth longer; stop also ends a blank one
+	defer stop()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.URL+"/api/chat", bytes.NewReader(body))
 	if err != nil {
 		return Usage{}, err
@@ -121,20 +136,84 @@ func (c *Client) ChatJSON(ctx context.Context, system, user string, schema any, 
 		return Usage{}, err
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		logger().Warn("model reply cut short", "model", c.Name, "bytes", len(raw), "err", err)
-	}
 	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
 		logger().Warn("model server refused", "model", c.Name, "status", resp.Status, "body", fmt.Sprintf("%.300s", raw))
 		err = fmt.Errorf("model server said %s: %s", resp.Status, strings.TrimSpace(string(raw)))
 		return Usage{}, err
 	}
-	if err = json.Unmarshal(raw, &reply); err != nil {
-		logger().Warn("model server reply unreadable", "model", c.Name, "err", err, "body", fmt.Sprintf("%.300s", raw))
-		err = fmt.Errorf("model server reply: %w", err)
-		return Usage{}, err
+	// The reply comes in pieces, each a JSON object; the last carries the counts. A model that types a double quote
+	// inside a text ends that text early, and the reply format then lets it write nothing but blank space, which it
+	// does until the limit: minutes lost, and Ollama's MLX runner has hung on it. So a long run of blank pieces
+	// ends the call.
+	var content strings.Builder
+	blank, pieces := 0, 0
+	var stalled atomic.Bool
+	idle := time.AfterFunc(time.Hour, func() { stalled.Store(true); stop() })
+	idle.Stop() // armed by the first words
+	defer idle.Stop()
+	call.Phase = "reading"
+	shown := time.Now()
+	for dec := json.NewDecoder(resp.Body); ; {
+		var part struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+			Error              string `json:"error"`
+			PromptEvalCount    int    `json:"prompt_eval_count"`
+			EvalCount          int    `json:"eval_count"`
+			PromptEvalDuration int64  `json:"prompt_eval_duration"`
+			EvalDuration       int64  `json:"eval_duration"`
+			LoadDuration       int64  `json:"load_duration"`
+		}
+		if derr := dec.Decode(&part); derr == io.EOF {
+			break
+		} else if derr != nil && stalled.Load() {
+			reply.Message.Content = content.String()
+			logger().Warn("model went silent; call ended", "model", c.Name, "after", maxSilence, "reply", fmt.Sprintf("%.200s", strings.TrimSpace(reply.Message.Content)))
+			err = fmt.Errorf("the model stopped writing words after: %.200s", strings.TrimSpace(reply.Message.Content))
+			return Usage{}, err
+		} else if derr != nil {
+			logger().Warn("model server reply unreadable", "model", c.Name, "err", derr)
+			err = fmt.Errorf("model server reply: %w", derr)
+			return Usage{}, err
+		}
+		if part.Error != "" {
+			err = fmt.Errorf("model server: %s", part.Error)
+			return Usage{}, err
+		}
+		content.WriteString(part.Message.Content)
+		if part.Message.Content != "" {
+			if pieces++; pieces == 1 {
+				call.Phase, call.FirstToken = "writing", time.Since(start)
+			}
+			if Observer != nil && time.Since(shown) > 400*time.Millisecond { // a watcher sees the reply grow
+				shown = time.Now()
+				call.Reply, call.Usage.ReplyTokens, call.Usage.Took = content.String(), pieces, time.Since(start)
+				Observer(call)
+			}
+		}
+		switch {
+		case part.Message.Content == "":
+		case strings.TrimSpace(part.Message.Content) == "":
+			blank++
+		default:
+			blank = 0
+			idle.Reset(maxSilence)
+		}
+		if blank >= maxBlank {
+			stop()
+			reply.Message.Content = content.String()
+			logger().Warn("model wrote only blank space; call ended", "model", c.Name, "took", time.Since(start).Round(time.Millisecond), "reply", fmt.Sprintf("%.200s", strings.TrimSpace(reply.Message.Content)))
+			err = fmt.Errorf("the model stopped writing words after: %.200s", strings.TrimSpace(reply.Message.Content))
+			return Usage{}, err
+		}
+		if part.EvalCount > 0 || part.PromptEvalCount > 0 {
+			reply.PromptEvalCount, reply.EvalCount = part.PromptEvalCount, part.EvalCount
+			reply.PromptEvalDuration, reply.EvalDuration, reply.LoadDuration = part.PromptEvalDuration, part.EvalDuration, part.LoadDuration
+		}
 	}
+	reply.Message.Content = content.String()
 	u = Usage{PromptTokens: reply.PromptEvalCount, ReplyTokens: reply.EvalCount, Took: time.Since(start),
 		Prefill: time.Duration(reply.PromptEvalDuration), Decode: time.Duration(reply.EvalDuration), Load: time.Duration(reply.LoadDuration)}
 	logger().Debug("model replied", "model", c.Name, "prompt_tokens", u.PromptTokens, "reply_tokens", u.ReplyTokens,

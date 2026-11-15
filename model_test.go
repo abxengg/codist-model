@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -68,7 +69,7 @@ func TestChatJSON(t *testing.T) {
 	if err != nil || out.Answer != 42 || u.PromptTokens != 100 || u.ReplyTokens != 7 || u.Prefill != 2*time.Second || u.DecodeRate() != 14 {
 		t.Fatalf("%v %+v %+v", err, out, u)
 	}
-	if got["model"] != "coder:7b" || got["stream"] != false || got["format"].(map[string]any)["type"] != "object" {
+	if got["model"] != "coder:7b" || got["stream"] != true || got["format"].(map[string]any)["type"] != "object" {
 		t.Errorf("request: %v", got)
 	}
 	msgs := got["messages"].([]any)
@@ -143,5 +144,58 @@ func TestObserverSeesEveryCall(t *testing.T) {
 	seen = nil
 	if _, err := bad.ChatJSON(context.Background(), "s", "u", nil, &out); err == nil || len(seen) != 2 || seen[1].Err == "" {
 		t.Fatalf("a failed call reports its error: %v %+v", err, seen)
+	}
+}
+
+// A streamed reply is put together from its pieces; one that turns into blank space is ended without waiting for
+// the model to reach its limit.
+func TestStreamedReplyAndBlankSpace(t *testing.T) {
+	blank := false
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		piece := func(text string) {
+			fmt.Fprintf(w, `{"message":{"content":%q},"done":false}`+"\n", text)
+			w.(http.Flusher).Flush()
+		}
+		piece(`{"a":`)
+		if blank {
+			for i := 0; i < 5000; i++ {
+				piece("\n  ")
+			}
+			return
+		}
+		piece(` "b"`)
+		piece(`}`)
+		io.WriteString(w, `{"message":{"content":""},"done":true,"prompt_eval_count":7,"eval_count":3}`+"\n")
+	}))
+	defer s.Close()
+	c := New(s.URL, "m", 4096)
+	var out struct{ A string }
+	u, err := c.ChatJSON(context.Background(), "s", "u", nil, &out)
+	if err != nil || out.A != "b" || u.PromptTokens != 7 || u.ReplyTokens != 3 {
+		t.Fatalf("%+v %+v %v", out, u, err)
+	}
+	blank = true
+	start := time.Now()
+	if _, err := c.ChatJSON(context.Background(), "s", "u", nil, &out); err == nil || !strings.Contains(err.Error(), "stopped writing words") || time.Since(start) > 5*time.Second {
+		t.Errorf("a reply of blank space: %v after %s", err, time.Since(start))
+	}
+}
+
+// A model that starts writing and then goes silent is not waited for.
+func TestSilentReplyIsEnded(t *testing.T) {
+	was := maxSilence
+	maxSilence = 300 * time.Millisecond
+	defer func() { maxSilence = was }()
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"message":{"content":%q},"done":false}`+"\n", `{"change": "key.equals(`)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done() // says nothing more, as long as the caller waits
+	}))
+	defer s.Close()
+	start := time.Now()
+	var out struct{}
+	_, err := New(s.URL, "m", 4096).ChatJSON(context.Background(), "s", "u", nil, &out)
+	if err == nil || !strings.Contains(err.Error(), "stopped writing words") || time.Since(start) > 5*time.Second {
+		t.Errorf("%v after %s", err, time.Since(start))
 	}
 }

@@ -27,18 +27,21 @@ func LabelOf(ctx context.Context) Label {
 	return l
 }
 
-// Call is one model call, as an observer sees it: once when it starts (Done false) and once when it ends.
+// Call is one model call, as an observer sees it: when it starts, about twice a second while the model writes (Reply
+// so far, Usage.ReplyTokens counting the pieces written), and once when it ends (Done).
 type Call struct {
-	ID     int64
-	Label  Label
-	Model  string
-	System string
-	User   string
-	Reply  string
-	Err    string
-	Start  time.Time
-	Done   bool
-	Usage  Usage
+	Phase      string        // "reading" the prompt until the first piece of the reply, then "writing"
+	FirstToken time.Duration // from the start to the first piece: the time spent reading the prompt
+	ID         int64
+	Label      Label
+	Model      string
+	System     string
+	User       string
+	Reply      string
+	Err        string
+	Start      time.Time
+	Done       bool
+	Usage      Usage
 }
 
 // Observer, when set, is told about every call when it starts and when it ends. It must return quickly.
