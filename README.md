@@ -2,8 +2,10 @@
 
 The parts of [Codist](https://github.com/abxengg/codist) that deal with text from outside the code:
 
-- the root package talks to the model server the user runs (Ollama today): it checks the server has the model and
-  asks for JSON that follows a schema. Codist contains no model of its own.
+- the root package talks to the model server the user runs: it checks the server has the model and asks for JSON
+  that follows a schema, streaming the reply so a stalled or runaway answer is stopped. Codist contains no model of
+  its own. It speaks Ollama's API only (`/api/tags`, `/api/chat`); OpenAI-style servers such as LM Studio are
+  [not supported yet](https://github.com/abxengg/codist-model/issues/1).
 - `incident` reads production logs: it finds the Java errors, groups repeats, and keeps both the innermost cause's
   stack frames and the outer exception's.
 
