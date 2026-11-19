@@ -61,3 +61,37 @@ func TestParseKeepsTheOuterFrames(t *testing.T) {
 		t.Errorf("an error with no cause has no separate outer frames: %+v", errs[1].Outer)
 	}
 }
+
+func TestParseNestedAndUnusualExceptionNames(t *testing.T) {
+	log := `2026-11-19T09:14:02.100+05:30 ERROR 1 --- [order-service] [nio-8081-exec-1] o.a.c.c.C.[.[.[/].[dispatcherServlet] : Servlet.service() threw exception
+feign.FeignException$NotFound: [404] during [POST] to [http://payment-service/payments/charges]
+	at feign.FeignException.clientErrorStatus(FeignException.java:219)
+	at com.shoplab.order.OrderService.pay(OrderService.java:28)
+2026-11-19T14:02:31.000+05:30 ERROR 1 --- [payment-service] [nio-8082-exec-3] c.s.payment.PaymentService : charge failed
+com.shoplab.payment.CardGateway$GatewayTimeout: no answer from acquirer within 8000 ms
+	at com.shoplab.payment.PaymentService.charge(PaymentService.java:26)
+2026-11-19T14:02:32.000+05:30  INFO 1 --- [payment-service] [main] c.s.payment.Config : using com.shoplab.payment.HttpCardGateway
+`
+	errs := Parse(log)
+	if len(errs) != 2 {
+		t.Fatalf("want 2 errors, got %d: %+v", len(errs), errs)
+	}
+	if errs[0].Type != "FeignException$NotFound" || errs[0].Frames[1].Line != 28 {
+		t.Errorf("feign error: %+v", errs[0])
+	}
+	if errs[1].Type != "CardGateway$GatewayTimeout" || errs[1].Frames[0].Method != "charge" {
+		t.Errorf("gateway error: %+v", errs[1])
+	}
+}
+
+func TestParseCountsALoggedExceptionAndItsTraceOnce(t *testing.T) {
+	log := `2026-11-19T11:05:10.000+05:30 ERROR 1 --- [order-service] [nio-8081-exec-1] o.a.c.c.C.[.[.[/].[dispatcherServlet] : Servlet.service() threw exception [Request processing failed: java.util.NoSuchElementException: No value present] orderId=90123
+java.util.NoSuchElementException: No value present
+	at java.base/java.util.Optional.get(Optional.java:143)
+	at com.shoplab.order.OrderService.customerOf(OrderService.java:32)
+`
+	errs := Parse(log)
+	if len(errs) != 1 || errs[0].Count != 1 || len(errs[0].Frames) != 2 {
+		t.Fatalf("want one error with its frames, got %+v", errs)
+	}
+}

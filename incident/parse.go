@@ -30,9 +30,12 @@ type Error struct {
 
 var (
 	// An exception line: com.x.FooException: message, optionally after a log prefix.
-	exceptionLine = regexp.MustCompile(`(?:^|\s|:\s)((?:[a-z_][\w]*\.)+[A-Z]\w*(?:Exception|Error|Throwable))(?::\s*(.*))?$`)
-	causedBy      = regexp.MustCompile(`^\s*Caused by:\s*((?:[a-z_][\w]*\.)+[A-Z][\w$]*)(?::\s*(.*))?$`)
-	frameLine     = regexp.MustCompile(`^\s*at\s+(?:[\w.-]+/+)?([\w$.]+)\.([\w$<>]+)\(([^:)]*)(?::(\d+))?\)`)
+	exceptionLine = regexp.MustCompile(`(?:^|\s|:\s)((?:[a-z_][\w]*\.)+[A-Z]\w*(?:Exception|Error|Throwable)(?:\$[A-Z]\w*)?)(?::\s*(.*))?$`)
+	// Any class name at the start of a line, such as CardGateway$GatewayTimeout. It counts as an
+	// exception only when a stack frame follows, since exceptions need not be named ...Exception.
+	thrownLine = regexp.MustCompile(`^((?:[a-z_][\w]*\.)+[A-Z][\w$]*)(?::\s*(.*))?$`)
+	causedBy   = regexp.MustCompile(`^\s*Caused by:\s*((?:[a-z_][\w]*\.)+[A-Z][\w$]*)(?::\s*(.*))?$`)
+	frameLine  = regexp.MustCompile(`^\s*at\s+(?:[\w.-]+/+)?([\w$.]+)\.([\w$<>]+)\(([^:)]*)(?::(\d+))?\)`)
 )
 
 // Parse finds the errors in a log, most frequent first.
@@ -49,7 +52,7 @@ func Parse(logs string) []Error {
 		errs = append(errs, cur)
 		cur, frames = nil, nil
 	}
-	for _, l := range lines {
+	for i, l := range lines {
 		if m := frameLine.FindStringSubmatch(l); m != nil && cur != nil {
 			n, _ := strconv.Atoi(m[4])
 			frames = append(frames, Frame{Class: m[1], Method: m[2], File: m[3], Line: n, Raw: strings.TrimSpace(l)})
@@ -67,7 +70,15 @@ func Parse(logs string) []Error {
 		if strings.HasPrefix(strings.TrimSpace(l), "...") || strings.TrimSpace(l) == "" && cur != nil && len(frames) > 0 {
 			continue
 		}
-		if m := exceptionLine.FindStringSubmatch(strings.TrimRight(l, " ")); m != nil {
+		m := exceptionLine.FindStringSubmatch(strings.TrimRight(l, " "))
+		if m == nil && i+1 < len(lines) && frameLine.MatchString(lines[i+1]) {
+			m = thrownLine.FindStringSubmatch(strings.TrimSpace(l))
+		}
+		if m != nil {
+			// A log line that only names the exception, followed by its stack trace, is one error, not two.
+			if cur != nil && len(frames) == 0 && len(cur.Causes) == 0 && cur.Type == short(m[1]) {
+				cur = nil
+			}
 			flush()
 			cur = &Error{Type: short(m[1]), Message: strings.TrimSpace(m[2]), Count: 1, First: strings.TrimSpace(l)}
 			cur.Root = cur.Type + message(cur.Message)
