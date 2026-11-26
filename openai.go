@@ -143,9 +143,16 @@ func (c *Client) chatOpenAI(ctx context.Context, system, user string, schema any
 	}
 	hr.Header.Set("Content-Type", "application/json")
 	hr.Header.Set("Accept", "text/event-stream")
+	var waited atomic.Bool // the first word did not come in time
+	first := time.AfterFunc(maxFirstWord, func() { waited.Store(true); stop() })
+	defer first.Stop()
 	resp, err := c.HTTP.Do(hr)
 	if err != nil {
-		err = fmt.Errorf("model server: %w", err)
+		if werr := waitError(waited.Load(), false, c.Name, ""); werr != nil {
+			err = werr
+		} else {
+			err = fmt.Errorf("model server: %w", err)
+		}
 		return Usage{}, err
 	}
 	defer resp.Body.Close()
@@ -222,13 +229,13 @@ func (c *Client) chatOpenAI(ctx context.Context, system, user string, schema any
 			}
 		} else {
 			blank = 0
+			first.Stop()
 			idle.Reset(maxSilence)
 		}
 	}
 	if serr := sc.Err(); serr != nil {
-		if stalled.Load() {
-			logger().Warn("model went silent; call ended", "model", c.Name, "after", maxSilence)
-			err = fmt.Errorf("the model stopped writing words after: %.200s", strings.TrimSpace(content.String()))
+		if stalled.Load() || waited.Load() {
+			err = waitError(waited.Load(), stalled.Load(), c.Name, content.String())
 		} else {
 			err = fmt.Errorf("model server reply: %w", serr)
 		}

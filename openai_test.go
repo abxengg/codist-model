@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // lmstudio is a fake OpenAI-style server: no Ollama paths, a model list, and replies streamed as server-sent events.
@@ -81,5 +82,28 @@ func TestOpenAIBlankSpaceEndsTheCall(t *testing.T) {
 	var out struct{ Answer string }
 	if _, err := c.ChatJSON(context.Background(), "s", "u", nil, &out); err == nil || !strings.Contains(err.Error(), "stopped writing") {
 		t.Errorf("want the blank-space guard, got %v", err)
+	}
+}
+
+// The first-word limit holds for OpenAI-style servers too.
+func TestOpenAIFirstWordLimit(t *testing.T) {
+	old := maxFirstWord
+	maxFirstWord = 300 * time.Millisecond
+	defer func() { maxFirstWord = old }()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		select { // answers, then writes nothing
+		case <-time.After(2 * time.Second):
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+	var out struct{ OK bool }
+	start := time.Now()
+	_, err := New(srv.URL+"/v1", "m", 4096).ChatJSON(context.Background(), "s", "u", nil, &out)
+	if err == nil || !strings.Contains(err.Error(), "wrote nothing") || time.Since(start) > time.Second {
+		t.Fatalf("after %s: %v", time.Since(start), err)
 	}
 }

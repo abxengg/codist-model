@@ -204,3 +204,56 @@ func TestSilentReplyIsEnded(t *testing.T) {
 		t.Errorf("%v after %s", err, time.Since(start))
 	}
 }
+
+// A call that gets no word in time ends with a clear error, whether the server is silent before answering at all or
+// after it: one call held the review lane for 17 minutes before this limit. A slow first word within the limit is
+// fine, and so is a long reply once words are coming.
+func TestFirstWordLimit(t *testing.T) {
+	old := maxFirstWord
+	maxFirstWord = 300 * time.Millisecond
+	defer func() { maxFirstWord = old }()
+	for _, c := range []struct {
+		name          string
+		headersAfter  time.Duration
+		firstAfter    time.Duration
+		wantErrSubstr string
+	}{
+		{"silent before answering", time.Second, 0, "wrote nothing"},
+		{"silent after answering", 0, time.Second, "wrote nothing"},
+		{"slow but in time", 0, 100 * time.Millisecond, ""},
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case <-time.After(c.headersAfter):
+			case <-r.Context().Done():
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			select {
+			case <-time.After(c.firstAfter):
+			case <-r.Context().Done():
+				return
+			}
+			for _, piece := range []string{`{\"ok\"`, `:true}`} {
+				fmt.Fprintf(w, `{"message":{"content":"%s"}}`+"\n", piece)
+				w.(http.Flusher).Flush()
+				time.Sleep(200 * time.Millisecond) // the whole reply takes longer than the first-word limit
+			}
+			io.WriteString(w, `{"done":true,"eval_count":2}`+"\n")
+		}))
+		var out struct{ OK bool }
+		start := time.Now()
+		_, err := New(srv.URL, "m", 4096).ChatJSON(context.Background(), "s", "u", nil, &out)
+		took := time.Since(start)
+		srv.Close()
+		switch {
+		case c.wantErrSubstr == "" && (err != nil || !out.OK):
+			t.Errorf("%s: %v %+v", c.name, err, out)
+		case c.wantErrSubstr != "" && (err == nil || !strings.Contains(err.Error(), c.wantErrSubstr)):
+			t.Errorf("%s: want an error with %q, got %v", c.name, c.wantErrSubstr, err)
+		case c.wantErrSubstr != "" && took > 900*time.Millisecond:
+			t.Errorf("%s: took %s to give up", c.name, took)
+		}
+	}
+}

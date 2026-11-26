@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -22,6 +24,33 @@ const maxBlank = 60
 // its own JSON text (an unescaped quote) can go on using up its whole reply limit without sending anything: seen
 // with Qwen 3.5, minutes of silence each time.
 var maxSilence = 30 * time.Second
+
+// maxFirstWord is how long a call may wait for its first word: queueing, loading the model and reading the prompt.
+// Without it only the 12-minute limit applied, and one call held the review lane for 17 minutes (shop-lab,
+// 2026-11-26). Over 288 calls that day the first word came after 16 s typically, 38 s for the slowest twentieth and
+// 63 s at most, so 3 minutes leaves room for a cold start. Client libraries keep the same three timers apart: first
+// word, gap between words, whole call. CODIST_FIRST_WORD (seconds) changes it, for a slow machine.
+var maxFirstWord = firstWordLimit()
+
+func firstWordLimit() time.Duration {
+	if n, err := strconv.Atoi(os.Getenv("CODIST_FIRST_WORD")); err == nil && n > 0 {
+		return time.Duration(n) * time.Second
+	}
+	return 3 * time.Minute
+}
+
+// waitError is the error for a call that ended by one of its timers, nil when none fired.
+func waitError(firstWord, stalled bool, name, reply string) error {
+	switch {
+	case firstWord:
+		logger().Warn("model wrote nothing; call ended", "model", name, "after", maxFirstWord)
+		return fmt.Errorf("the model wrote nothing for %s; it may be busy or still loading", maxFirstWord)
+	case stalled:
+		logger().Warn("model went silent; call ended", "model", name, "after", maxSilence, "reply", fmt.Sprintf("%.200s", strings.TrimSpace(reply)))
+		return fmt.Errorf("the model stopped writing words after: %.200s", strings.TrimSpace(reply))
+	}
+	return nil
+}
 
 // Client calls one model on one server.
 type Client struct {
@@ -141,8 +170,15 @@ func (c *Client) ChatJSON(ctx context.Context, system, user string, schema any, 
 		return Usage{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	var waited atomic.Bool // the first word did not come in time
+	first := time.AfterFunc(maxFirstWord, func() { waited.Store(true); stop() })
+	defer first.Stop()
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
+		if werr := waitError(waited.Load(), false, c.Name, ""); werr != nil {
+			err = werr
+			return Usage{}, err
+		}
 		logger().Warn("model call failed", "model", c.Name, "took", time.Since(start), "err", err)
 		err = fmt.Errorf("model server: %w", err)
 		return Usage{}, err
@@ -180,10 +216,9 @@ func (c *Client) ChatJSON(ctx context.Context, system, user string, schema any, 
 		}
 		if derr := dec.Decode(&part); derr == io.EOF {
 			break
-		} else if derr != nil && stalled.Load() {
+		} else if derr != nil && (stalled.Load() || waited.Load()) {
 			reply.Message.Content = content.String()
-			logger().Warn("model went silent; call ended", "model", c.Name, "after", maxSilence, "reply", fmt.Sprintf("%.200s", strings.TrimSpace(reply.Message.Content)))
-			err = fmt.Errorf("the model stopped writing words after: %.200s", strings.TrimSpace(reply.Message.Content))
+			err = waitError(waited.Load(), stalled.Load(), c.Name, reply.Message.Content)
 			return Usage{}, err
 		} else if derr != nil {
 			logger().Warn("model server reply unreadable", "model", c.Name, "err", derr)
@@ -211,6 +246,7 @@ func (c *Client) ChatJSON(ctx context.Context, system, user string, schema any, 
 			blank++
 		default:
 			blank = 0
+			first.Stop()
 			idle.Reset(maxSilence)
 		}
 		if blank >= maxBlank {
