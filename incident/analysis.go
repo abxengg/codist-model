@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -292,8 +293,10 @@ var causeSchema = map[string]any{
 }
 
 const causeSystem = `You help an engineer find the cause of a production error in a Java service.
-You get the errors, the project's code at each stack frame, and the commits that last changed those lines.
-Base every statement on what you are given. In "evidence", copy exact lines from the logs or the code; each is checked.
+You get the errors, the project's code at each stack frame, the commits that last changed those lines, the issues
+Codist's review already found open in those files, and the warnings logged around the errors. An open issue in a
+file the error passes through is strong evidence: say whether it explains the error. Warnings often say what went
+wrong before the exception (a timeout, a retry, a duplicate). Base every statement on what you are given. In "evidence", copy exact lines from the logs or the code; each is checked.
 Give one to three causes, most likely first. If the evidence does not show a cause, say so and use low confidence.
 "fix" is a concrete change to the code. Reply with JSON only.`
 
@@ -309,24 +312,7 @@ func Explain(ctx context.Context, a *Analysis, logs string, m *model.Client) {
 		}
 		return
 	}
-	var b, corpus strings.Builder
-	corpus.WriteString(logs)
-	for _, e := range a.Errors[:min(3, len(a.Errors))] {
-		fmt.Fprintf(&b, "## %s: %s (seen %d times)\n", e.Exception, e.Message, e.Count)
-		for _, c := range e.CausedBy {
-			fmt.Fprintf(&b, "Caused by: %s\n", c)
-		}
-		for _, f := range e.Frames[:min(12, len(e.Frames))] {
-			fmt.Fprintf(&b, "  at %s.%s(%s:%d)\n", f.Class, f.Method, f.File, f.Line)
-		}
-	}
-	for _, l := range a.Locations[:min(5, len(a.Locations))] {
-		fmt.Fprintf(&b, "\n## %s line %d (%s.%s)\n```java\n%s```\n", l.Path, l.Line, l.Class, l.Method, l.Snippet)
-		corpus.WriteString("\n" + l.Snippet)
-		if l.Blame.SHA != "" {
-			fmt.Fprintf(&b, "Line last changed by %s \"%s\" (%s)\n", l.Blame.SHA[:min(7, len(l.Blame.SHA))], l.Blame.Summary, l.Blame.Author)
-		}
-	}
+	user, corpus := prompt(a, logs)
 	var out struct {
 		Summary   string `json:"summary"`
 		Impact    string `json:"impact"`
@@ -337,13 +323,13 @@ func Explain(ctx context.Context, a *Analysis, logs string, m *model.Client) {
 		} `json:"causes"`
 	}
 	a.Model = m.Name
-	if _, err := m.ChatJSON(ctx, causeSystem, b.String(), causeSchema, &out); err != nil {
+	if _, err := m.ChatJSON(ctx, causeSystem, user, causeSchema, &out); err != nil {
 		slog.Warn("incident not explained", "lib", "model", "id", a.ID, "err", err)
 		a.Status, a.Error = "failed", err.Error()
 		return
 	}
 	squash := func(s string) string { return strings.Join(strings.Fields(s), "") }
-	all, inLogs := squash(corpus.String()), squash(logs)
+	all, inLogs := squash(corpus), squash(logs)
 	for _, c := range out.Causes {
 		cause := Cause{Title: c.Title, Explanation: c.Explanation, Confidence: c.Confidence, Fix: c.Fix, Evidence: []Evidence{}}
 		dropped := 0
@@ -408,4 +394,74 @@ func Markdown(a Analysis) string {
 		fmt.Fprintf(&b, "## Fix\n%s\n", a.Report.Fix)
 	}
 	return b.String()
+}
+
+// prompt is what the model is told about an incident: the errors with their frames, the code at each location with
+// who last changed it and the issues already open in that file, and the warnings in the logs. corpus is every text
+// the model may quote, for checking its evidence.
+func prompt(a *Analysis, logs string) (user, corpus string) {
+	var b, c strings.Builder
+	c.WriteString(logs)
+	for _, e := range a.Errors[:min(3, len(a.Errors))] {
+		fmt.Fprintf(&b, "## %s: %s (seen %d times)\n", e.Exception, e.Message, e.Count)
+		for _, cb := range e.CausedBy {
+			fmt.Fprintf(&b, "Caused by: %s\n", cb)
+		}
+		for _, f := range e.Frames[:min(12, len(e.Frames))] {
+			fmt.Fprintf(&b, "  at %s.%s(%s:%d)\n", f.Class, f.Method, f.File, f.Line)
+		}
+	}
+	seen := map[string]bool{}
+	for _, l := range a.Locations[:min(5, len(a.Locations))] {
+		fmt.Fprintf(&b, "\n## %s line %d (%s.%s)\n```java\n%s```\n", l.Path, l.Line, l.Class, l.Method, l.Snippet)
+		c.WriteString("\n" + l.Snippet)
+		if l.Blame.SHA != "" {
+			fmt.Fprintf(&b, "Line last changed by %s \"%s\" (%s)\n", l.Blame.SHA[:min(7, len(l.Blame.SHA))], l.Blame.Summary, l.Blame.Author)
+		}
+		if len(l.Issues) > 0 && !seen[l.Path] {
+			seen[l.Path] = true
+			b.WriteString("Issues Codist's review already found open in this file:\n")
+			for _, is := range l.Issues[:min(8, len(l.Issues))] {
+				fmt.Fprintf(&b, "- %s\n", is)
+			}
+		}
+	}
+	if w := warnings(logs, 12); len(w) > 0 {
+		b.WriteString("\n## Warnings in the logs\n")
+		for _, l := range w {
+			b.WriteString(l + "\n")
+		}
+	}
+	return b.String(), c.String()
+}
+
+var warnLine = regexp.MustCompile(`\bWARN(ING)?\b`)
+
+// warnings are the distinct WARN lines of a log, in order, up to n. Lines that differ only in numbers and ids count
+// once, so a warning repeated for every request is shown once.
+func warnings(logs string, n int) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, l := range strings.Split(logs, "\n") {
+		if !warnLine.MatchString(l) {
+			continue
+		}
+		l = strings.TrimSpace(l)
+		key := numbers.ReplaceAllString(l, "#")
+		if i := strings.Index(key, "WARN"); i >= 0 {
+			key = key[i:] // the time and thread before the level differ on every line
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		if len(l) > 300 {
+			l = l[:300] + "…"
+		}
+		out = append(out, l)
+		if len(out) == n {
+			break
+		}
+	}
+	return out
 }

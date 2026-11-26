@@ -132,3 +132,23 @@ func TestExplainWithoutModel(t *testing.T) {
 		t.Errorf("%+v", failed)
 	}
 }
+
+func TestPromptHasOpenIssuesAndWarnings(t *testing.T) {
+	withWarnings := "2026-11-19T14:02:10.000+05:30  WARN 1 --- [exec-1] c.s.payment.PaymentService : card gateway timed out, orderId=88500 attempt=1\n" +
+		"2026-11-19T14:02:20.000+05:30  WARN 1 --- [exec-2] c.s.payment.PaymentService : card gateway timed out, orderId=88501 attempt=2\n" +
+		"2026-11-19T16:40:02.000+05:30  WARN 1 --- [recon-1] c.s.payment.Reconciliation : acquirer reports 3 charges for orderId=88502, expected 1\n" + logs
+	a := Read("9", "T", time.Now(), withWarnings, shop{})
+	user, corpus := prompt(&a, withWarnings)
+	if !strings.Contains(user, "Issues Codist's review already found open in this file:\n- Division by zero") {
+		t.Errorf("open issues missing:\n%s", user)
+	}
+	if !strings.Contains(user, "## Warnings in the logs") || !strings.Contains(user, "acquirer reports 3 charges") {
+		t.Errorf("warnings missing:\n%s", user)
+	}
+	if strings.Count(user, "card gateway timed out") != 1 {
+		t.Errorf("a warning repeated with other numbers should show once:\n%s", user)
+	}
+	if !strings.Contains(corpus, "acquirer reports 3 charges") {
+		t.Error("the model may quote the logs, so they must be in the corpus")
+	}
+}
