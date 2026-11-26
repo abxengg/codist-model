@@ -1,5 +1,6 @@
 // Package model talks to the model server the user runs. Codist does not contain a model: the user
-// starts one (Ollama today) and gives Codist its address.
+// starts one (Ollama, or a server that speaks OpenAI's protocol such as LM Studio or llama.cpp) and gives Codist its
+// address.
 package model
 
 import (
@@ -36,6 +37,9 @@ func New(url, name string, ctx int) *Client {
 
 // Status says whether the server answers and has the model, in words a person can act on.
 func (c *Client) Status(ctx context.Context) (bool, string) {
+	if c.api(ctx) == apiOpenAI {
+		return c.statusOpenAI(ctx)
+	}
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, c.URL+"/api/tags", nil)
@@ -47,10 +51,15 @@ func (c *Client) Status(ctx context.Context) (bool, string) {
 	defer resp.Body.Close()
 	var tags struct {
 		Models []struct{ Name string } `json:"models"`
+		Error  string                  `json:"error"` // LM Studio answers Ollama's question with an error, as JSON
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&tags); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&tags); err != nil || resp.StatusCode != http.StatusOK || tags.Error != "" {
+		// Not Ollama: maybe a server that speaks OpenAI's protocol (LM Studio, llama.cpp, vLLM).
+		if c.tryOpenAI(ctx) {
+			return c.statusOpenAI(ctx)
+		}
 		logger().Warn("model server answered unlike Ollama", "url", c.URL, "status", resp.Status, "err", err)
-		return false, "the server at " + c.URL + " did not answer like Ollama"
+		return false, "the server at " + c.URL + " did not answer like Ollama or like an OpenAI-style server (LM Studio, llama.cpp)"
 	}
 	for _, m := range tags.Models {
 		if m.Name == c.Name || m.Name == c.Name+":latest" {
@@ -81,6 +90,9 @@ func (u Usage) DecodeRate() float64 {
 // given, is a JSON schema the server must follow, so required fields such as a quoted line of code
 // cannot be left out.
 func (c *Client) ChatJSON(ctx context.Context, system, user string, schema any, out any) (Usage, error) {
+	if c.api(ctx) == apiOpenAI {
+		return c.chatOpenAI(ctx, system, user, schema, out)
+	}
 	format := any("json")
 	if schema != nil {
 		format = schema

@@ -38,6 +38,11 @@ func TestStatus(t *testing.T) {
 	}
 	for _, c := range cases {
 		cl := server(t, func(w http.ResponseWriter, r *http.Request) {
+			// A server that is not Ollama is also asked whether it speaks OpenAI's protocol; this one does not.
+			if r.URL.Path == "/v1/models" && c.name == "not Ollama" {
+				http.NotFound(w, r)
+				return
+			}
 			if r.URL.Path != "/api/tags" {
 				t.Errorf("asked %s", r.URL.Path)
 			}
