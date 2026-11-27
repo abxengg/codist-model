@@ -3,9 +3,14 @@
 The parts of [Codist](https://github.com/abxengg/codist) that deal with text from outside the code:
 
 - the root package talks to the model server the user runs: it checks the server has the model and asks for JSON
-  that follows a schema, streaming the reply so a stalled or runaway answer is stopped. Codist contains no model of
-  its own. It speaks Ollama's API only (`/api/tags`, `/api/chat`); OpenAI-style servers such as LM Studio are
-  [not supported yet](https://github.com/abxengg/codist-model/issues/1).
+  that follows a schema, streaming the reply. Codist contains no model of its own. It speaks Ollama's API
+  (`/api/tags`, `/api/chat`) and the OpenAI-style API of LM Studio, llama.cpp's server, vLLM and Jan
+  (`/v1/models`, `/v1/chat/completions`), and finds out which by asking; `CODIST_MODEL_API` or an address ending in
+  `/v1` decides it.
+- three timers end a call that will not finish: no first word in 3 minutes (`CODIST_FIRST_WORD`, seconds; one call
+  had held Codist's review lane for 17 minutes, while over 288 calls the first word came after 63 s at most), 30
+  seconds of silence once the model is writing, and 12 minutes in all. A reply that turns into blank space is ended
+  too.
 - `incident` reads production logs: it finds the Java errors, groups repeats, and keeps both the innermost cause's
   stack frames and the outer exception's.
 
